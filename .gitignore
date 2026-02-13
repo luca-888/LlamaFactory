@@ -181,3 +181,10 @@ wandb/
 swanlog/
 generated_predictions.jsonl
 predictions_score.json
+_archive_unused/
+
+# local large raw data
+/data/raw_data/train_full_217735_v2.json
+
+# local datasets
+/data/
