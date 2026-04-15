@@ -85,6 +85,10 @@ class DataArguments:
         default=None,
         metadata={"help": "The number of processes to use for the pre-processing."},
     )
+    mm_preprocess_cache_dir: str | None = field(
+        default=None,
+        metadata={"help": "Path to cache multimodal metadata used during pre-processing. Disabled if unspecified."},
+    )
     max_samples: int | None = field(
         default=None,
         metadata={"help": "For debugging purposes, truncate the number of examples for each dataset."},

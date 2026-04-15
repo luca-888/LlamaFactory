@@ -240,6 +240,7 @@ def _get_preprocessed_dataset(
     if dataset is None:
         return None
 
+    template.mm_plugin.mm_preprocess_cache_dir = data_args.mm_preprocess_cache_dir
     dataset_processor = _get_dataset_processor(
         data_args, stage, template, tokenizer, processor, do_generate=(training_args.predict_with_generate and is_eval)
     )

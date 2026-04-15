@@ -15,18 +15,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import inspect
+import json
 import math
 import os
 import re
 from copy import deepcopy
 from dataclasses import dataclass
 from io import BytesIO
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, BinaryIO, Literal, NotRequired, Optional, TypedDict, Union
 
 import numpy as np
 import torch
 import torchaudio
+from huggingface_hub.utils import WeakFileLock
 from transformers.image_utils import get_image_size, is_valid_image, make_flat_list_of_images, to_numpy_array
 from transformers.models.mllama.processing_mllama import (
     convert_sparse_cross_attention_mask_to_dense,
@@ -37,6 +41,9 @@ from typing_extensions import override
 
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER
 from ..extras.packages import is_pillow_available, is_pyav_available, is_transformers_version_greater_than
+
+
+QWEN3VL_MM_PREPROCESS_CACHE_VERSION = 1
 
 
 if is_pillow_available():
@@ -142,6 +149,7 @@ class MMPluginMixin:
     video_token: str | None
     audio_token: str | None
     expand_mm_tokens: bool = True
+    mm_preprocess_cache_dir: str | None = None
 
     def _validate_input(
         self,
@@ -409,6 +417,16 @@ class MMPluginMixin:
 
 @dataclass
 class BasePlugin(MMPluginMixin):
+    def _get_mm_inputs_for_token_expansion(
+        self,
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        processor: "MMProcessor",
+    ) -> dict[str, "torch.Tensor"]:
+        r"""Build multimodal metadata needed to expand media placeholders before tokenization."""
+        return self._get_mm_inputs(images, videos, audios, processor)
+
     def process_messages(
         self,
         messages: list[dict[str, str]],
@@ -1802,6 +1820,298 @@ class Qwen2VLPlugin(BasePlugin):
 
 @dataclass
 class Qwen3VLPlugin(Qwen2VLPlugin):
+    def _get_qwen3vl_cache_value(self, value):
+        if isinstance(value, torch.Tensor):
+            return value.tolist()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (list, tuple)):
+            return [self._get_qwen3vl_cache_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._get_qwen3vl_cache_value(val) for key, val in value.items()}
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _get_qwen3vl_size_value(self, size, key: str, default: int) -> int:
+        if isinstance(size, dict):
+            return size.get(key, default)
+        return getattr(size, key, default)
+
+    def _get_qwen3vl_video_cache_key(self, video: "VideoInput", processor: "MMProcessor") -> str | None:
+        if not isinstance(video, str) or not os.path.isfile(video):
+            return None
+
+        video_processor: BaseImageProcessor = getattr(processor, "video_processor", None)
+        image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
+        stat = os.stat(video)
+        key = {
+            "cache_version": QWEN3VL_MM_PREPROCESS_CACHE_VERSION,
+            "plugin": "qwen3_vl",
+            "processor": processor.__class__.__name__,
+            "image_processor": image_processor.__class__.__name__ if image_processor is not None else None,
+            "video_processor": video_processor.__class__.__name__ if video_processor is not None else None,
+            "video": {
+                "path": os.path.abspath(video),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            },
+            "params": {
+                "image_temporal_patch_size": getattr(image_processor, "temporal_patch_size", None),
+                "image_merge_size": getattr(image_processor, "merge_size", None),
+                "video_fps": getattr(processor, "video_fps", 2.0),
+                "video_maxlen": getattr(processor, "video_maxlen", 128),
+                "video_max_pixels": getattr(processor, "video_max_pixels", 256 * 256),
+                "video_min_pixels": getattr(processor, "video_min_pixels", 16 * 16),
+                "patch_size": getattr(video_processor, "patch_size", None),
+                "temporal_patch_size": getattr(video_processor, "temporal_patch_size", None),
+                "merge_size": getattr(video_processor, "merge_size", None),
+                "size": self._get_qwen3vl_cache_value(getattr(video_processor, "size", None)),
+            },
+        }
+        key_text = json.dumps(key, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(key_text.encode("utf-8")).hexdigest()
+
+    def _get_qwen3vl_video_cache_path(self, video: "VideoInput", processor: "MMProcessor") -> str | None:
+        if self.mm_preprocess_cache_dir is None:
+            return None
+
+        cache_key = self._get_qwen3vl_video_cache_key(video, processor)
+        if cache_key is None:
+            return None
+
+        cache_dir = os.path.join(os.path.abspath(os.path.expanduser(self.mm_preprocess_cache_dir)), "qwen3_vl")
+        return os.path.join(cache_dir, f"{cache_key}.json")
+
+    def _load_qwen3vl_video_cache(self, video: "VideoInput", processor: "MMProcessor") -> dict | None:
+        cache_path = self._get_qwen3vl_video_cache_path(video, processor)
+        if cache_path is None or not os.path.exists(cache_path):
+            return None
+
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                cache_data = json.load(f)
+        except Exception:
+            return None
+
+        if cache_data.get("cache_version") != QWEN3VL_MM_PREPROCESS_CACHE_VERSION:
+            return None
+
+        metadata = cache_data.get("metadata")
+        if not isinstance(metadata, dict):
+            return None
+
+        if "video_grid_thw" not in metadata or "frames_indices" not in metadata or "fps" not in metadata:
+            return None
+
+        return metadata
+
+    def _save_qwen3vl_video_cache(
+        self, video: "VideoInput", processor: "MMProcessor", metadata: dict
+    ) -> None:
+        cache_path = self._get_qwen3vl_video_cache_path(video, processor)
+        if cache_path is None:
+            return
+
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp_path = f"{cache_path}.{os.getpid()}.tmp"
+        lock_path = f"{cache_path}.lock"
+        cache_data = {
+            "cache_version": QWEN3VL_MM_PREPROCESS_CACHE_VERSION,
+            "metadata": self._get_qwen3vl_cache_value(metadata),
+        }
+        with WeakFileLock(lock_path):
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(cache_data, f, sort_keys=True)
+                os.replace(tmp_path, cache_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+    def _get_qwen3vl_regularized_video_size(
+        self, width: int, height: int, processor: "MMProcessor"
+    ) -> tuple[int, int]:
+        image_max_pixels = getattr(processor, "video_max_pixels", 256 * 256)
+        image_min_pixels = getattr(processor, "video_min_pixels", 16 * 16)
+
+        if (width * height) > image_max_pixels:
+            resize_factor = math.sqrt(image_max_pixels / (width * height))
+            width, height = int(width * resize_factor), int(height * resize_factor)
+
+        if (width * height) < image_min_pixels:
+            resize_factor = math.sqrt(image_min_pixels / (width * height))
+            width, height = int(width * resize_factor), int(height * resize_factor)
+
+        if min(width, height) < 28:
+            width, height = max(width, 28), max(height, 28)
+
+        if width / height > 200:
+            width, height = height * 180, height
+
+        if height / width > 200:
+            width, height = width, width * 180
+
+        return width, height
+
+    def _get_qwen3vl_video_grid_thw(
+        self, num_frames: int, height: int, width: int, processor: "MMProcessor"
+    ) -> list[int] | None:
+        try:
+            from transformers.models.qwen3_vl.video_processing_qwen3_vl import smart_resize
+        except Exception:
+            return None
+
+        video_processor: BaseImageProcessor = getattr(processor, "video_processor", None)
+        patch_size: int = getattr(video_processor, "patch_size", 16)
+        temporal_patch_size: int = getattr(video_processor, "temporal_patch_size", 2)
+        merge_size: int = getattr(video_processor, "merge_size", 2)
+        size = getattr(video_processor, "size", {})
+        min_pixels = self._get_qwen3vl_size_value(size, "shortest_edge", 128 * 32 * 32)
+        max_pixels = self._get_qwen3vl_size_value(size, "longest_edge", 32 * 32 * 768)
+
+        try:
+            resized_height, resized_width = smart_resize(
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                temporal_factor=temporal_patch_size,
+                factor=patch_size * merge_size,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+            )
+        except Exception:
+            return None
+
+        grid_t = math.ceil(num_frames / temporal_patch_size)
+        grid_h = resized_height // patch_size
+        grid_w = resized_width // patch_size
+        return [grid_t, grid_h, grid_w]
+
+    def _build_qwen3vl_video_cache_metadata(self, video: "VideoInput", processor: "MMProcessor") -> dict | None:
+        if not isinstance(video, str) or not os.path.isfile(video) or not is_pyav_available():
+            return None
+
+        container = None
+        try:
+            container = av.open(video, "r")
+            video_stream = next(stream for stream in container.streams if stream.type == "video")
+            width = getattr(video_stream.codec_context, "width", None)
+            height = getattr(video_stream.codec_context, "height", None)
+            if width is None or height is None or width <= 0 or height <= 0:
+                return None
+
+            sample_indices = self._get_video_sample_indices(
+                video_stream,
+                video_fps=getattr(processor, "video_fps", 2.0),
+                video_maxlen=getattr(processor, "video_maxlen", 128),
+            )
+            if len(sample_indices) == 0:
+                return None
+
+            original_fps = float(video_stream.average_rate) if video_stream.average_rate is not None else None
+            if original_fps is None or original_fps <= 0:
+                return None
+
+            video_fps = getattr(processor, "video_fps", 2.0)
+            if video_fps <= 0:
+                return None
+
+            frames_indices = [float(idx) / original_fps * video_fps for idx in sample_indices]
+            if video_stream.duration is None:
+                duration = len(sample_indices) / video_fps
+                fps_per_video = video_fps
+            else:
+                duration = float(video_stream.duration * video_stream.time_base)
+                if duration <= 0:
+                    return None
+
+                fps_per_video = len(sample_indices) / duration
+
+            num_frames = len(sample_indices)
+            if num_frames % 2 != 0:
+                num_frames += 1
+
+            regularized_width, regularized_height = self._get_qwen3vl_regularized_video_size(width, height, processor)
+            video_grid_thw = self._get_qwen3vl_video_grid_thw(
+                num_frames, regularized_height, regularized_width, processor
+            )
+            if video_grid_thw is None:
+                return None
+
+            return {
+                "video_grid_thw": video_grid_thw,
+                "frames_indices": frames_indices,
+                "fps": video_fps,
+                "duration": duration,
+                "total_num_frames": num_frames,
+                "fps_per_video": fps_per_video,
+            }
+        except Exception:
+            return None
+        finally:
+            if container is not None:
+                container.close()
+
+    def _get_cached_qwen3vl_video_expansion_inputs(
+        self, videos: list["VideoInput"], processor: "MMProcessor"
+    ) -> dict[str, Union[list, "torch.Tensor"]] | None:
+        if self.mm_preprocess_cache_dir is None or len(videos) == 0:
+            return None
+
+        video_grid_thw = []
+        video_metadata = []
+        fps_per_video = []
+        for video in videos:
+            metadata = self._load_qwen3vl_video_cache(video, processor)
+            if metadata is None:
+                metadata = self._build_qwen3vl_video_cache_metadata(video, processor)
+                if metadata is None:
+                    return None
+
+                self._save_qwen3vl_video_cache(video, processor, metadata)
+
+            video_grid_thw.append(metadata["video_grid_thw"])
+            video_metadata.append(
+                SimpleNamespace(
+                    frames_indices=metadata["frames_indices"],
+                    fps=metadata["fps"],
+                    duration=metadata.get("duration"),
+                    total_num_frames=metadata.get("total_num_frames"),
+                )
+            )
+            fps_per_video.append(metadata.get("fps_per_video", metadata["fps"]))
+
+        mm_inputs = {
+            "video_grid_thw": torch.tensor(video_grid_thw),
+            "video_metadata": video_metadata,
+        }
+        image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
+        temporal_patch_size: int = getattr(image_processor, "temporal_patch_size", 2)
+        if "second_per_grid_ts" in getattr(processor, "model_input_names", []):
+            mm_inputs["second_per_grid_ts"] = [temporal_patch_size / fps for fps in fps_per_video]
+
+        return mm_inputs
+
+    @override
+    def _get_mm_inputs_for_token_expansion(
+        self,
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        processor: "MMProcessor",
+    ) -> dict[str, "torch.Tensor"]:
+        video_inputs = self._get_cached_qwen3vl_video_expansion_inputs(videos, processor)
+        if video_inputs is None:
+            return self._get_mm_inputs(images, videos, audios, processor)
+
+        mm_inputs = {}
+        if len(images) != 0:
+            mm_inputs.update(self._get_mm_inputs(images, [], audios, processor))
+
+        mm_inputs.update(video_inputs)
+        return mm_inputs
+
     @override
     def _get_mm_inputs(
         self,
@@ -1867,19 +2177,17 @@ class Qwen3VLPlugin(Qwen2VLPlugin):
         image_merge_length: int = getattr(image_processor, "merge_size") ** 2
         video_merge_length: int = getattr(video_processor, "merge_size") ** 2
         if self.expand_mm_tokens:
-            mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
+            mm_inputs = self._get_mm_inputs_for_token_expansion(images, videos, audios, processor)
             image_grid_thw = mm_inputs.get("image_grid_thw", [])
             video_grid_thw = mm_inputs.get("video_grid_thw", [])
-            num_frames = video_grid_thw[0][0] if len(video_grid_thw) > 0 else 0  # hard code for now
             video_metadata = mm_inputs.get("video_metadata", [])
 
         else:
             image_grid_thw = [None] * len(images)
             video_grid_thw = [None] * len(videos)
-            num_frames = 0
             timestamps = [0]
 
-        for idx, message in enumerate(messages):
+        for message in messages:
             content = message["content"]
             while IMAGE_PLACEHOLDER in content:
                 image_seqlen = (
@@ -1894,19 +2202,20 @@ class Qwen3VLPlugin(Qwen2VLPlugin):
 
             while VIDEO_PLACEHOLDER in content:
                 if self.expand_mm_tokens:
-                    metadata = video_metadata[idx]
+                    metadata = video_metadata[num_video_tokens]
+                    metadata_frames_indices = (
+                        metadata["frames_indices"] if isinstance(metadata, dict) else metadata.frames_indices
+                    )
+                    metadata_fps = metadata["fps"] if isinstance(metadata, dict) else metadata.fps
                     timestamps = processor._calculate_timestamps(
-                        metadata.frames_indices,
-                        metadata.fps,
+                        metadata_frames_indices,
+                        metadata_fps,
                         video_processor.merge_size,
                     )
                     video_structure = ""
+                    num_frames = int(video_grid_thw[num_video_tokens][0])
                     for frame_index in range(num_frames):
-                        video_seqlen = (
-                            video_grid_thw[num_video_tokens][1:].prod() // video_merge_length
-                            if self.expand_mm_tokens
-                            else 1
-                        )
+                        video_seqlen = int(video_grid_thw[num_video_tokens][1:].prod() // video_merge_length)
                         timestamp_sec = timestamps[frame_index]
                         frame_structure = (
                             f"<{timestamp_sec:.1f} seconds>"

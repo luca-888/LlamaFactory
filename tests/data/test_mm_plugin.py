@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -88,6 +89,33 @@ INPUT_IDS = [0, 1, 2, 3, 4]
 LABELS = [0, 1, 2, 3, 4]
 
 BATCH_IDS = [[1] * 1024]
+
+
+class DummyQwen3ImageProcessor:
+    merge_size = 2
+    temporal_patch_size = 2
+
+
+class DummyQwen3VideoProcessor:
+    merge_size = 2
+    patch_size = 16
+    temporal_patch_size = 2
+    size = {"shortest_edge": 128 * 32 * 32, "longest_edge": 32 * 32 * 768}
+
+
+class DummyQwen3Processor:
+    image_processor = DummyQwen3ImageProcessor()
+    video_processor = DummyQwen3VideoProcessor()
+    model_input_names = []
+    video_max_pixels = 256 * 256
+    video_min_pixels = 16 * 16
+    video_maxlen = 128
+
+    def __init__(self, video_fps: float = 2.0):
+        self.video_fps = video_fps
+
+    def _calculate_timestamps(self, frames_indices, fps, merge_size):
+        return frames_indices
 
 
 def _get_mm_inputs(processor: "ProcessorMixin") -> dict[str, "torch.Tensor"]:
@@ -432,6 +460,83 @@ def test_qwen3_vl_plugin():
         for message in VIDEO_MESSAGES
     ]
     _check_plugin(**check_inputs)
+
+
+def test_qwen3_vl_plugin_uses_video_placeholder_index_for_metadata(monkeypatch):
+    qwen3_vl_plugin = get_mm_plugin(name="qwen3_vl", video_token="<|video_pad|>")
+    processor = DummyQwen3Processor()
+    messages = [
+        {"role": "user", "content": "First text turn."},
+        {"role": "assistant", "content": "Acknowledge."},
+        {"role": "user", "content": "<video>What is in this video?"},
+    ]
+
+    def fake_get_mm_inputs(images, videos, audios, processor):
+        return {
+            "video_grid_thw": torch.tensor([[2, 2, 2]]),
+            "video_metadata": [SimpleNamespace(frames_indices=[0.2, 1.2], fps=2.0)],
+        }
+
+    monkeypatch.setattr(qwen3_vl_plugin, "_get_mm_inputs", fake_get_mm_inputs)
+
+    assert qwen3_vl_plugin.process_messages(messages, NO_IMAGES, VIDEOS, NO_AUDIOS, processor) == [
+        {"role": "user", "content": "First text turn."},
+        {"role": "assistant", "content": "Acknowledge."},
+        {
+            "role": "user",
+            "content": (
+                "<0.2 seconds><|vision_start|><|video_pad|><|vision_end|>"
+                "<1.2 seconds><|vision_start|><|video_pad|><|vision_end|>"
+                "What is in this video?"
+            ),
+        },
+    ]
+
+
+def test_qwen3_vl_preprocess_cache_hit_skips_video_regularization(monkeypatch, tmp_path):
+    qwen3_vl_plugin = get_mm_plugin(name="qwen3_vl", video_token="<|video_pad|>")
+    qwen3_vl_plugin.mm_preprocess_cache_dir = str(tmp_path)
+    processor = DummyQwen3Processor()
+
+    def fake_cached_inputs(videos, processor):
+        return {
+            "video_grid_thw": torch.tensor([[2, 2, 2]]),
+            "video_metadata": [SimpleNamespace(frames_indices=[0.2, 1.2], fps=2.0)],
+        }
+
+    def fail_regularize_videos(*args, **kwargs):
+        raise AssertionError("cache hit should not regularize videos")
+
+    monkeypatch.setattr(qwen3_vl_plugin, "_get_cached_qwen3vl_video_expansion_inputs", fake_cached_inputs)
+    monkeypatch.setattr(qwen3_vl_plugin, "_regularize_videos", fail_regularize_videos)
+
+    assert qwen3_vl_plugin.process_messages(VIDEO_MESSAGES, NO_IMAGES, VIDEOS, NO_AUDIOS, processor) == [
+        {
+            "role": "user",
+            "content": (
+                "<0.2 seconds><|vision_start|><|video_pad|><|vision_end|>"
+                "<1.2 seconds><|vision_start|><|video_pad|><|vision_end|>"
+                "What is in this video?"
+            ),
+        },
+        {"role": "assistant", "content": "A cat."},
+    ]
+
+
+def test_qwen3_vl_video_cache_invalidates_when_processor_params_change(tmp_path):
+    qwen3_vl_plugin = get_mm_plugin(name="qwen3_vl", video_token="<|video_pad|>")
+    qwen3_vl_plugin.mm_preprocess_cache_dir = str(tmp_path)
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"fake video")
+
+    cache_path = qwen3_vl_plugin._get_qwen3vl_video_cache_path(str(video_path), DummyQwen3Processor(video_fps=2.0))
+    changed_cache_path = qwen3_vl_plugin._get_qwen3vl_video_cache_path(
+        str(video_path), DummyQwen3Processor(video_fps=4.0)
+    )
+
+    assert cache_path is not None
+    assert changed_cache_path is not None
+    assert cache_path != changed_cache_path
 
 
 @pytest.mark.runs_on(["cpu", "mps"])
