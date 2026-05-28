@@ -2355,6 +2355,26 @@ class Qwen3VLPlugin(Qwen2VLPlugin):
         return mm_inputs
 
     @override
+    def get_mm_inputs(
+        self,
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        imglens: list[int],
+        vidlens: list[int],
+        audlens: list[int],
+        batch_ids: list[list[int]],
+        processor: Optional["MMProcessor"],
+    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        self._validate_input(processor, images, videos, audios)
+        mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
+
+        # Used by processor / prompt expansion, not by model.forward or model.generate.
+        mm_inputs.pop("video_metadata", None)
+
+        return mm_inputs
+
+    @override
     def process_messages(
         self,
         messages: list[dict[str, str]],
@@ -2379,16 +2399,13 @@ class Qwen3VLPlugin(Qwen2VLPlugin):
 
             image_grid_thw = mm_inputs.get("image_grid_thw", [])
             video_grid_thw = mm_inputs.get("video_grid_thw", [])
-            num_frames = video_grid_thw[0][0] if len(video_grid_thw) > 0 else 0  # hard code for now
             video_metadata = mm_inputs.get("video_metadata", [])
 
         else:
             image_grid_thw = [None] * len(images)
             video_grid_thw = [None] * len(videos)
-            num_frames = 0
-            timestamps = [0]
 
-        for idx, message in enumerate(messages):
+        for message in messages:
             content = message["content"]
             while IMAGE_PLACEHOLDER in content:
                 image_seqlen = (
@@ -2403,19 +2420,17 @@ class Qwen3VLPlugin(Qwen2VLPlugin):
 
             while VIDEO_PLACEHOLDER in content:
                 if self.expand_mm_tokens:
-                    metadata = video_metadata[idx]
+                    video_grid = video_grid_thw[num_video_tokens]
+                    num_frames = int(video_grid[0].item())
+                    metadata = video_metadata[num_video_tokens]
                     timestamps = processor._calculate_timestamps(
                         metadata.frames_indices,
                         metadata.fps,
-                        video_processor.merge_size,
+                        getattr(video_processor, "temporal_patch_size", video_processor.merge_size),
                     )
                     video_structure = ""
+                    video_seqlen = int((video_grid[1:].prod() // video_merge_length).item())
                     for frame_index in range(num_frames):
-                        video_seqlen = (
-                            video_grid_thw[num_video_tokens][1:].prod() // video_merge_length
-                            if self.expand_mm_tokens
-                            else 1
-                        )
                         timestamp_sec = timestamps[frame_index]
                         frame_structure = (
                             f"<{timestamp_sec:.1f} seconds>"
