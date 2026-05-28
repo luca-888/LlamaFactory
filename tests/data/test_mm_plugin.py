@@ -57,15 +57,18 @@ TEXT_MESSAGES = [
 ]
 
 VIDEO_MESSAGES = [
-    {"role": "user", "content": "<video>What is in this video?"},
-    {"role": "assistant", "content": "A cat."},
+    {"role": "user", "content": "Compare these videos: <video> and <video>."},
+    {"role": "assistant", "content": "They are different."},
 ]
 
 AUDIOS = [np.zeros(1600)]
 
 IMAGES = [Image.new("RGB", (32, 32), (255, 255, 255))]
 
-VIDEOS = [[Image.new("RGB", (32, 32), (255, 255, 255))] * 4]
+VIDEOS = [
+    [Image.new("RGB", (32, 32), (255, 255, 255))] * 4,
+    [Image.new("RGB", (32, 32), (255, 255, 255))] * 6,
+]
 
 NO_IMAGES = []
 
@@ -422,21 +425,35 @@ def test_qwen2_vl_plugin():
 def test_qwen3_vl_plugin():
     frame_seqlen = 1
     tokenizer_module = _load_tokenizer_module(model_name_or_path="Qwen/Qwen3-VL-30B-A3B-Instruct")
+    processor = tokenizer_module["processor"]
     qwen3_vl_plugin = get_mm_plugin(name="qwen3_vl", video_token="<|video_pad|>")
     check_inputs = {"plugin": qwen3_vl_plugin, **tokenizer_module}
+    mm_inputs = qwen3_vl_plugin._get_mm_inputs(NO_IMAGES, VIDEOS, NO_AUDIOS, processor)
+    mm_inputs.pop("video_metadata", None)
+    video_token = "<|video_pad|>" * frame_seqlen
+    video_structures = [
+        f"<0.2 seconds><|vision_start|>{video_token}<|vision_end|>"
+        f"<1.2 seconds><|vision_start|>{video_token}<|vision_end|>",
+        (
+            f"<0.2 seconds><|vision_start|>{video_token}<|vision_end|>"
+            f"<1.2 seconds><|vision_start|>{video_token}<|vision_end|>"
+            f"<2.2 seconds><|vision_start|>{video_token}<|vision_end|>"
+        ),
+    ]
     check_inputs["expected_mm_messages"] = [
         {
-            key: value.replace(
-                "<video>",  # little different with original processor for default `fps=2` in our repo
-                "<0.2 seconds><|vision_start|>{}<|vision_end|><1.2 seconds><|vision_start|>{}<|vision_end|>".format(
-                    "<|video_pad|>" * frame_seqlen, "<|video_pad|>" * frame_seqlen
-                ),
-            )
+            key: value.replace("<video>", video_structures[0], 1).replace("<video>", video_structures[1], 1)
             for key, value in message.items()
         }
         for message in VIDEO_MESSAGES
     ]
     _check_plugin(**check_inputs)
+    _is_close(
+        qwen3_vl_plugin.get_mm_inputs(
+            NO_IMAGES, VIDEOS, NO_AUDIOS, NO_IMGLENS, [len(VIDEOS)], NO_AUDLENS, BATCH_IDS, processor
+        ),
+        mm_inputs,
+    )
 
 
 @pytest.mark.runs_on(["cpu", "mps"])
@@ -452,7 +469,7 @@ def test_qwen3_vl_plugin_video_path():
     processor = tokenizer_module["processor"]
     qwen3_vl_plugin = get_mm_plugin(name="qwen3_vl", video_token="<|video_pad|>")
 
-    videos = [video_path]
+    videos = [video_path, video_path]
 
     # fast path: metadata-only, no frame decoding
     fast_mm_inputs = qwen3_vl_plugin._get_mm_token_metadata([], videos, [], processor)
@@ -467,9 +484,9 @@ def test_qwen3_vl_plugin_video_path():
     )
     result = qwen3_vl_plugin.process_messages(VIDEO_MESSAGES, [], videos, [], processor)
     # This demo video duration is 9.72s, with video_fps=2, we extract 19 frames
-    # 19 + 1 => temperoal compress => 10 video_sequence
-    assert result[0]["content"].count("<|vision_start|>") == 10, (
-        f"Expected 10 video tokens, got {result[0]['content'].count('<|vision_start|>')}"
+    # 19 + 1 => temperoal compress => 10 video_sequence per video
+    assert result[0]["content"].count("<|vision_start|>") == 20, (
+        f"Expected 20 video tokens, got {result[0]['content'].count('<|vision_start|>')}"
     )
 
 
